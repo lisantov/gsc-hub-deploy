@@ -1,33 +1,150 @@
+# gsc-hub — развёртывание на сервере.
+#
+#   :80  nginx  ── статика приложения (build/client запечён в образ)
+#                 └─ reverse proxy ──► app:3000 (SvelteKit, adapter-node)
+#                                       └─ /data/  ◄── том gsc-hub-data
+#   127.0.0.1:8080  db-admin (sqlite-web, только чтение) ──┘
+#
+# Сети:
+#   frontend — наружу (nginx + app);
+#   backend  — internal: только app, db и db-admin, без выхода в интернет
+#              и без доступа извне.
+#
+# Томом владеет контейнер db (SQLite — файл, а не сетевой сервер, поэтому
+# «вынести БД» здесь означает: данные живут в отдельном томе, а не в
+# контейнере приложения). app и db-admin подключают этот том к себе.
+
 services:
-  gsc:
-    build: .
-    container_name: gsc
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: nginx
+    container_name: gsc-nginx
     restart: unless-stopped
-    # Optional: the setup wizard stores everything in SQLite, so a fresh
-    # checkout starts without a .env. Needs Docker Compose 2.24+.
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      # Порт на хосту меняется через HTTP_PORT в .env, если 80 занят.
+      - "${HTTP_PORT:-80}:80"
+      # TLS: положите сертификаты и раскомментируйте (см. deploy/nginx.conf).
+      # - "443:443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - frontend
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: gsc-app
+    restart: unless-stopped
     env_file:
+      # ORIGIN, ADMIN_EMAIL/ADMIN_PASSWORD, GOOGLE_CLIENT_* и прочее — в .env
       - path: .env
         required: false
     environment:
       HOST: 0.0.0.0
       PORT: 3000
       DB_PATH: /data/gsc-hub.db
-      # adapter-node assumes https when deriving the request origin, so Auth.js
-      # would build an https://localhost callback — but OAuth runs over plain http
-      # on localhost (Google rejects .local). Pin the auth base to http so the
-      # redirect_uri matches the one registered in the GCP OAuth client.
-      AUTH_URL: http://localhost:5173
-      # OrbStack publishes gsc.local to the whole network, so requests arrive on
-      # a non-loopback host and the app would otherwise refuse to serve them
-      # without a login. This says: that network is trusted, keep single-user
-      # mode. Set ADMIN_EMAIL/ADMIN_PASSWORD and drop this if it is not.
-      EXPOSED_MODE: "0"
-    ports:
-      # Loopback only. Google rejects OAuth redirects to .local, so connect
-      # accounts over http://localhost:5173; use https://gsc.local day-to-day.
-      - "127.0.0.1:5173:3000"
+      AUTH_TRUST_HOST: "true"
+      # За обратным прокси: схема и клиентский адрес приходят из заголовков,
+      # которые ставит nginx. Без PROTOCOL_HEADER adapter-node считает запрос
+      # https и отклоняет формы с «Cross-site POST form submissions are forbidden».
+      PROTOCOL_HEADER: x-forwarded-proto
+      ADDRESS_HEADER: X-Forwarded-For
+      XFF_DEPTH: "1"
+    expose:
+      - "3000"
     volumes:
-      - ./data:/data
-    labels:
-      dev.orbstack.domains: gsc.local
-      dev.orbstack.http_port: "3000"
+      - db-data:/data
+    depends_on:
+      db:
+        condition: service_started
+    healthcheck:
+      # Простой HTTP-запрос: он же прогоняет guard, который при первом обращении
+      # создаёт /data/gsc-hub.db со схемой — к этому моменту db-admin уже может
+      # открыть базу в режиме только чтения.
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://127.0.0.1:3000/', r => process.exit(0)).on('error', () => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks:
+      - frontend
+      - backend
+    logging: *logging
+
+  db:
+    # SQLite не является сетевой СУБД: сервера, к которому можно подключиться по
+    # сети, у него нет. Контейнер db владеет томом с файлом базы, поэтому данные
+    # переживают пересоздание и обновление контейнера приложения.
+    # Бэкап тома: docker run --rm -v gsc-hub-data:/data:ro -v "$PWD":/backup \
+    #              alpine tar czf /backup/gsc-hub-$(date +%F).tar.gz -C /data .
+    image: alpine:3.22
+    container_name: gsc-db
+    restart: unless-stopped
+    command: ["sh", "-c", "exec tail -f /dev/null"]
+    volumes:
+      - db-data:/data
+    networks:
+      - backend
+    logging: *logging
+
+  db-admin:
+    # Веб-просмотр базы. Слушает только 127.0.0.1 хоста — наружу он не виден,
+    # для доступа с рабочей машины пробросьте порт: ssh -L 8080:127.0.0.1:8080
+    image: coleifer/sqlite-web:latest
+    container_name: gsc-db-admin
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      SQLITE_DATABASE: /data/gsc-hub.db
+    # -r: соединение только на чтение — правки в интерфейсе запрещены, данные
+    # защищены от случайного UPDATE/DELETE. Чтобы разрешить правки, уберите -r.
+    # -P включается только если задан SQLITE_WEB_PASSWORD в .env — иначе
+    # sqlite-web пошёл бы запрашивать пароль в терминал и упал бы без TTY.
+    command:
+      - sh
+      - -c
+      - |
+        if [ -n "$${SQLITE_WEB_PASSWORD:-}" ]; then set -- -P; fi
+        exec sqlite_web -H 0.0.0.0 -x -r "$$@" "$$SQLITE_DATABASE"
+    ports:
+      - "127.0.0.1:${DB_ADMIN_PORT:-8080}:8080"
+    volumes:
+      - db-data:/data
+    depends_on:
+      db:
+        condition: service_started
+      app:
+        condition: service_healthy
+    networks:
+      - backend
+    logging: *logging
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true
+
+volumes:
+  db-data:
+    # Имя фиксировано, чтобы бэкапы и миграции не зависели от имени каталога.
+    name: gsc-hub-data

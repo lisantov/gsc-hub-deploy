@@ -22,3 +22,9 @@ COPY --from=builder /app/package.json ./
 
 EXPOSE 3000
 CMD ["node", "build/index.js"]
+
+# Статика для контейнера nginx: те же собранные клиентские файлы, но вместо
+# Node-сервера в образ кладётся nginx (конфиг подключается в compose.yaml).
+FROM nginx:1.29-alpine AS nginx
+COPY --from=builder /app/build/client /usr/share/nginx/html
+
