@@ -2,6 +2,10 @@ FROM node:22-alpine AS builder
 RUN corepack enable
 WORKDIR /app
 
+# Сборка на маленьких VPS: без лимита vite/svelte-kit может съесть всю память
+# и заморозить сервер целиком. Падение процесса лучше зависания.
+ENV NODE_OPTIONS=--max-old-space-size=768
+
 # Native build deps for better-sqlite3 (node-gyp)
 RUN apk add --no-cache python3 make g++
 
