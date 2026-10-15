@@ -1,14 +1,17 @@
 # gsc-hub — развёртывание на сервере.
 #
 #   :80  nginx  ── статика приложения (build/client запечён в образ)
-#                 └─ reverse proxy ──► app:3000 (SvelteKit, adapter-node)
-#                                       └─ /data/  ◄── том gsc-hub-data
+#                 ├─ reverse proxy ──► app:3000 (SvelteKit, adapter-node)
+#                 │                      └─ /data/  ◄── том gsc-hub-data
+#                 └─ ACME webroot  ◄── certbot (том certbot-www)
+#   :443 nginx  ── то же по HTTPS; включается сам, когда certbot выпустил
+#                  сертификат (HTTPS_DOMAIN в .env), с редиректом с :80
 #   127.0.0.1:8080  db-admin (sqlite-web, только чтение) ──┘
 #
 # Сети:
-#   frontend — наружу (nginx + app);
+#   frontend — наружу (nginx, app, certbot);
 #   backend  — internal: только app, db и db-admin, без выхода в интернет
-#              и без доступа извне.
+#              и без доступа извне.ТО
 #
 # Томом владеет контейнер db (SQLite — файл, а не сетевой сервер, поэтому
 # «вынести БД» здесь означает: данные живут в отдельном томе, а не в
@@ -27,11 +30,22 @@ services:
         condition: service_healthy
     ports:
       # Порт на хосту меняется через HTTP_PORT в .env, если 80 занят.
+      # Внимание: для Let's Encrypt порт 80 должен быть именно 80 и доступен
+      # из интернета — при HTTPS_DOMAIN задайте HTTP_PORT=80 (или не задавайте).
       - "${HTTP_PORT:-80}:80"
-      # TLS: положите сертификаты и раскомментируйте (см. deploy/nginx.conf).
-      # - "443:443"
+      # HTTPS включается сам, когда certbot выпустит сертификат (см. выше).
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      # Домен Let's Encrypt; пусто — работаем только на HTTP.
+      HTTPS_DOMAIN: ${HTTPS_DOMAIN:-}
+    # Штатный entrypoint образа вызывается из скрипта: он следит за наличием
+    # сертификата, включает блок 443 и редирект с 80, перезагружает nginx
+    # после продления сертификата.
+    entrypoint: ["/bin/sh", "/etc/nginx/gsc/entrypoint.sh"]
     volumes:
-      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/nginx:/etc/nginx/gsc:ro
+      - certbot-letsencrypt:/etc/letsencrypt:ro
+      - certbot-www:/var/www/certbot:ro
     networks:
       - frontend
     logging: &logging
@@ -137,6 +151,30 @@ services:
       - backend
     logging: *logging
 
+  certbot:
+    # Сертификат Let's Encrypt (HTTP-01 через webroot): nginx отдаёт файлы
+    # вызова ACME из /var/www/certbot, поэтому порт 80 должен быть доступен
+    # из интернета, а HTTPS_DOMAIN — указывать на этот сервер.
+    # Пока HTTPS_DOMAIN/LETSENCRYPT_EMAIL не заданы в .env, контейнер спит.
+    # Сертификат живёт в томе certbot-letsencrypt; продление — раз в 12 часов.
+    image: certbot/certbot:latest
+    container_name: gsc-certbot
+    restart: unless-stopped
+    environment:
+      HTTPS_DOMAIN: ${HTTPS_DOMAIN:-}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL:-}
+    entrypoint: ["/bin/sh", "/etc/gsc/entrypoint.sh"]
+    volumes:
+      - ./deploy/certbot:/etc/gsc:ro
+      - certbot-letsencrypt:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    depends_on:
+      nginx:
+        condition: service_started
+    networks:
+      - frontend
+    logging: *logging
+
 networks:
   frontend:
     driver: bridge
@@ -148,3 +186,8 @@ volumes:
   db-data:
     # Имя фиксировано, чтобы бэкапы и миграции не зависели от имени каталога.
     name: gsc-hub-data
+  certbot-letsencrypt:
+    # Выпуск Let's Encrypt: живёт вне контейнеров, чтобы пережить их пересоздание.
+    name: gsc-hub-letsencrypt
+  # Webroot для ACME-вызовов: одноразовый, имя-каталог не важен.
+  certbot-www:
